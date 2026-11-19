@@ -1,0 +1,106 @@
+name: Build CyIME offline APK
+
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/build-offline-apk.yml']
+  workflow_dispatch:
+    inputs:
+      version:
+        description: CyIME upstream release tag
+        required: true
+        default: '1.15.100'
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - name: Check out the upstream release
+        uses: actions/checkout@v7
+        with:
+          repository: Cyletix/CyIME
+          ref: refs/tags/${{ inputs.version || '1.15.100' }}
+          submodules: recursive
+          persist-credentials: false
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: gradle
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v4
+        with:
+          packages: platform-tools
+
+      - name: Install SDK, NDK and CMake
+        run: |
+          sdkmanager 'platforms;android-36' 'build-tools;36.0.0' 'ndk;29.0.14206865' 'cmake;3.22.1'
+          ndk="$ANDROID_HOME/ndk/29.0.14206865"
+          printf 'ANDROID_NDK_HOME=%s\nANDROID_NDK=%s\n' "$ndk" "$ndk" >> "$GITHUB_ENV"
+
+      - name: Build offline APKs with bundled models
+        run: |
+          bash ./gradlew downloadOnnx --no-daemon
+          bash ./gradlew assembleOffline -PbundleModels=true -PpythonExecutable=python3 --no-daemon
+
+      - name: Sign and verify the ARM64 APK
+        env:
+          CYIME_KEYSTORE_BASE64: ${{ secrets.CYIME_KEYSTORE_BASE64 }}
+          CYIME_KEYSTORE_PASSWORD: ${{ secrets.CYIME_KEYSTORE_PASSWORD }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          apks=(app/build/outputs/apk/offline/*-full-arm64-v8a.apk)
+          if (( ${#apks[@]} != 1 )); then
+            echo 'Expected exactly one offline ARM64 APK.' >&2
+            exit 1
+          fi
+
+          build_tools="$ANDROID_HOME/build-tools/36.0.0"
+          work_dir=$(mktemp -d "$RUNNER_TEMP/cyime-offline.XXXXXX")
+          trap 'rm -r -- "$work_dir"' EXIT
+          chmod 700 "$work_dir"
+          keystore="$work_dir/cyime-offline.p12"
+          if [[ -n "$CYIME_KEYSTORE_BASE64" && -n "$CYIME_KEYSTORE_PASSWORD" ]]; then
+            printf '%s' "$CYIME_KEYSTORE_BASE64" | base64 --decode > "$keystore"
+          elif [[ -z "$CYIME_KEYSTORE_BASE64" && -z "$CYIME_KEYSTORE_PASSWORD" ]]; then
+            CYIME_KEYSTORE_PASSWORD=$(openssl rand -hex 24)
+            export CYIME_KEYSTORE_PASSWORD
+            keytool -genkeypair -storetype PKCS12 -keystore "$keystore" -alias cyime-offline \
+              -keyalg RSA -keysize 2048 -validity 10000 -dname 'CN=CyIME Offline' \
+              -storepass:env CYIME_KEYSTORE_PASSWORD
+            echo 'This APK uses a signing key generated for this run.'
+          else
+            echo 'Configure both signing secrets or leave both unset.' >&2
+            exit 1
+          fi
+
+          mkdir -p offline-apk
+          output="offline-apk/$(basename "${apks[0]}" .apk)-offline.apk"
+          "$build_tools/zipalign" -P 16 -f 4 "${apks[0]}" "$work_dir/aligned.apk"
+          "$build_tools/apksigner" sign --ks "$keystore" --ks-key-alias cyime-offline \
+            --ks-pass env:CYIME_KEYSTORE_PASSWORD --v1-signing-enabled true --v2-signing-enabled true \
+            --out "$output" "$work_dir/aligned.apk"
+          "$build_tools/apksigner" verify --min-sdk-version 23 --verbose --print-certs "$output"
+          permissions=$("$build_tools/aapt" dump permissions "$output")
+          if [[ "$permissions" == *android.permission.INTERNET* ]]; then
+            echo 'The APK declares android.permission.INTERNET.' >&2
+            exit 1
+          fi
+          (cd offline-apk && sha256sum -- *.apk > SHA256SUMS)
+
+      - name: Upload the APK and checksum
+        uses: actions/upload-artifact@v7
+        with:
+          name: CyIME-offline-arm64-v8a
+          path: offline-apk/
+          if-no-files-found: error
+          compression-level: 0
