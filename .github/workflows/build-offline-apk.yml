@@ -46,6 +46,38 @@ jobs:
           ndk="$ANDROID_HOME/ndk/29.0.14206865"
           printf 'ANDROID_NDK_HOME=%s\nANDROID_NDK=%s\n' "$ndk" "$ndk" >> "$GITHUB_ENV"
 
+      - name: Prepare verified dependencies for CyIME 1.15.100
+        if: ${{ (inputs.version || '1.15.100') == '1.15.100' }}
+        run: |
+          set -euo pipefail
+          work_dir=$(mktemp -d "$RUNNER_TEMP/cyime-deps.XXXXXX")
+          trap 'rm -r -- "$work_dir"' EXIT
+
+          # The official AAR contains matching headers and native libraries.
+          aar="$work_dir/onnxruntime.aar"
+          curl -fsSL --retry 3 --max-time 180 \
+            https://repo.maven.apache.org/maven2/com/microsoft/onnxruntime/onnxruntime-android/1.28.0/onnxruntime-android-1.28.0.aar \
+            -o "$aar"
+          printf '%s  %s\n' f351a0638696f54b35184290dbc001d66daae17281ad0b548d2c70347d53b8a9 "$aar" | sha256sum -c -
+          unzip -q "$aar" 'headers/*' 'jni/*/libonnxruntime.so' -d "$work_dir"
+          runtime=app/src/main/jni/onnxruntime
+          mkdir -p "$runtime/include"
+          cp -r "$work_dir/headers/." "$runtime/include/"
+          for abi in armeabi-v7a arm64-v8a x86 x86_64; do
+            library="$work_dir/jni/$abi/libonnxruntime.so"
+            install -D -m 644 "$library" "$runtime/lib/$abi/libonnxruntime.so"
+            install -D -m 644 "$library" "app/src/main/jniLibs/$abi/libonnxruntime.so"
+          done
+
+          # Seed the upstream cache with the mirror file matching the pinned digest.
+          speaker=3dspeaker_speech_campplus_sv_zh-cn_16k-common.onnx
+          cache=.gradle/bundled-model-cache/speaker-campplus-zh
+          mkdir -p "$cache"
+          curl -fsSL --retry 3 --max-time 180 \
+            "https://www.modelscope.cn/models/Cyletix/cyime-model/resolve/master/$speaker" -o "$work_dir/$speaker"
+          printf '%s  %s\n' f682b514c05d947ee3fa91cd6ec6c5c7543479a128373fa29b1faedccd21fd11 "$work_dir/$speaker" | sha256sum -c -
+          mv -- "$work_dir/$speaker" "$cache/$speaker"
+
       - name: Build offline APKs with bundled models
         run: |
           bash ./gradlew downloadOnnx --no-daemon
